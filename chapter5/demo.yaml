@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS in Action: chapter 4'
+Resources:
+######################################## VPC - Internet Gateway ###########################################
+    VPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: '10.0.0.0/16'
+        EnableDnsHostnames: 'true'
+        Tags:
+          - Value: Name
+            Key: 'AWS in Action: chapter 5 (VPC)'
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway # An IGW is needed to enable traffic to and from the internet
+      Properties: {}
+    VPCGatewayAttachment: # Attach the IGW to VPC
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref VPC
+        InternetGatewayId: !Ref InternetGateway
+###################### Public Subnet - Route Table - Association - Route to internet ######################## 
+    SubnetPublicProxy:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: !Select [0, !GetAZs ''] # Picks the first availability zone in the region
+        CidrBlock: '10.0.1.0/24'
+        MapPublicIpOnLaunch: true
+        VpcId: !Ref VPC
+        Tags:
+          - Value: Name
+            Key: 'Public Proxy'
+    RouteTablePublicProxy:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref VPC
+    RouteTableAssociationPublicProxy:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId: !Ref RouteTablePublicProxy 
+        SubnetId: !Ref SubnetPublicProxy
+    RoutePublicProxyToInternet:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref RouteTablePublicProxy
+        DestinationCidrBlock: '0.0.0.0/0' # Route to Internet
+        GatewayId: !Ref InternetGateway
+      DependsOn: VPCGatewayAttachment
+############################# NAT gateway - Elastic IP address ########################################
+    EIPNatGateway:
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: 'vpc'
+    NatGateway:
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId: !GetAtt 'EIPNatGateway.AllocationId'
+        SubnetId: !Ref SubnetPublicProxy
+##################### Private Subnet - Route Table ########################################################
+    SubnetPrivateBackend:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: !Select [0, !GetAZs '']
+        CidrBlock: '10.0.2.0/24'
+        VpcId: !Ref VPC
+        Tags:
+          - Value: Name
+            Key: 'Private Backend'
+    RouteTablePrivateBackend:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref VPC
+    RouteTableAssociationPrivateBackend:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        RouteTableId: !Ref RouteTablePrivateBackend 
+        SubnetId: !Ref SubnetPrivateBackend
+    RoutePrivateBackendToInternet:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref RouteTablePrivateBackend
+        DestinationCidrBlock: '0.0.0.0/0'
+        NatGatewayId: !Ref NatGateway
+#################### Instance Profile - Instance Role #################
+    InstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Roles:
+          - !Ref InstanceRole
+    InstanceRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'ec2.amazonaws.com'
+            Action: 'sts:AssumeRole'
+        ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+#################### Security Group - Proxy (Instance) - Backend (Instance) ###############################
+    SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: 'Allowing all incoming and outgoing trafic'
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          - IpProtocol: '-1'
+            FromPort: '-1'
+            ToPort: '-1'
+            CidrIp: '0.0.0.0/0'
+        SecurityGroupEgress:
+          - IpProtocol: '-1'
+            FromPort: '-1'
+            ToPort: '-1'
+            CidrIp: '0.0.0.0/0'
+    Proxy:
+      Type: AWS::EC2::Instance
+      Properties:
+        ImageId: 'ami-0453ec754f44f9a4a'
+        InstanceType: 't2.micro'
+        IamInstanceProfile: !Ref InstanceProfile
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetId: !Ref SubnetPublicProxy
+        UserData:
+          'Fn::Base64': !Sub |
+            #!/bin/bash -ex
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Proxy --region ${AWS::Region}' ERR
+            amazon-linux-extras install haproxy2
+            cat <<"EOF" | tee /etc/haproxy2/haproxy2.cfg > /dev/null
+            # ---------------------------------------------------------------------
+            # Example configuration for a possible web application.  See the
+            # full configuration options online.
+            #
+            #   https://www.haproxy.org/download/1.8/doc/configuration.txt
+            #
+            #---------------------------------------------------------------------
+
+            #---------------------------------------------------------------------
+            # Global settings
+            #---------------------------------------------------------------------
+            global
+                log         127.0.0.1 local2
+
+                chroot      /var/lib/haproxy2
+                pidfile     /var/run/haproxy2.pid
+                maxconn     4000
+                user        haproxy
+                group       haproxy
+                daemon
+
+                # turn on stats unix socket
+                stats socket /var/lib/haproxy2/stats
+
+                # utilize system-wide crypto-policies
+                ssl-default-bind-ciphers PROFILE=SYSTEM
+                ssl-default-server-ciphers PROFILE=SYSTEM
+
+            #---------------------------------------------------------------------
+            # common defaults that all the 'listen' and 'backend' sections will
+            # use if not designated in their block
+            #---------------------------------------------------------------------
+            defaults
+                mode                    http
+                log                     global
+                option                  httplog
+                option                  dontlognull
+                option http-server-close
+                option forwardfor       except 127.0.0.0/8
+                option                  redispatch
+                retries                 3
+                timeout http-request    10s
+                timeout queue           1m
+                timeout connect         10s
+                timeout client          1m
+                timeout server          1m
+                timeout http-keep-alive 10s
+                timeout check           10s
+                maxconn                 3000
+
+            #---------------------------------------------------------------------
+            # main frontend which proxys to the backends
+            #---------------------------------------------------------------------
+            frontend main
+                bind *:80
+                default_backend             app
+
+            #---------------------------------------------------------------------
+            # round robin balancing between the various backends
+            #---------------------------------------------------------------------
+            backend app
+                balance     roundrobin
+                server  app1 ${Backend.PrivateIp}:80 check
+            EOF
+            systemctl start haproxy2
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource Proxy --region ${AWS::Region}
+        Tags:
+          - Value: Name
+            Key: Proxy
+      DependsOn: VPCGatewayAttachment
+    Backend:
+      Type: AWS::EC2::Instance
+      Properties:
+        ImageId: 'ami-0453ec754f44f9a4a'
+        InstanceType: 't2.micro'
+        IamInstanceProfile: !Ref InstanceProfile
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetId: !Ref SubnetPrivateBackend
+        Tags:
+          - Value: Name
+            Key: Backend
+        UserData:
+          'Fn::Base64': !Sub |
+            #!/bin/bash -ex
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Backend --region ${AWS::Region}' ERR
+            yum -y install httpd
+            systemctl start httpd
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource Backend --region ${AWS::Region}
+      DependsOn: RoutePrivateBackendToInternet
+Outputs:
+  ProxyPublicIpAddress:
+    Value: !Sub ${Proxy.PublicIp}
+    Description: 'Proxy public IP address'
