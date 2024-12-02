@@ -29,7 +29,7 @@ Resources:
   VM:
     Type: 'AWS::EC2::Instance'
     Properties:
-      ImageId: 'ami-012967cc5a8c9f891'
+      ImageId: 'ami-061ac2e015473fbe2'
       InstanceType: !Ref InstanceType
       IamInstanceProfile: 'ec2-ssm-core'
       SecurityGroupIds: [!Ref SecurityGroup]
